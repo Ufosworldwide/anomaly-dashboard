@@ -25,39 +25,18 @@ export default async function handler(req, res) {
         score: (f.altitude > 45000 ? 2 : 0) + (f.velocity > 900 ? 2 : 0)
       }));
 
-    const report = {
+    res.status(200).json({
       timestamp: new Date().toISOString(),
       totalFlights: flights.length,
       anomalyCount: anomalies.length,
       anomalies,
       source: data.states?.length ? "live" : "fallback"
-    };
-
-    // 🔥 FIREBASE WRITE (direct REST API)
-    await fetch(
-      "https://firestore.googleapis.com/v1/projects/anomaly-intelligence/databases/(default)/documents/daily_reports",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          fields: {
-            timestamp: { stringValue: report.timestamp },
-            totalFlights: { integerValue: String(report.totalFlights) },
-            anomalyCount: { integerValue: String(report.anomalyCount) },
-            source: { stringValue: report.source }
-          }
-        })
-      }
-    );
-
-    res.status(200).json(report);
+    });
 
   } catch (err) {
     res.status(500).json({
-      error: "system failure",
+      error: "API crashed safely",
       details: err.message
     });
   }
-}}
+}
