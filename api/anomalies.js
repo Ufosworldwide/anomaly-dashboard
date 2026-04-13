@@ -1,7 +1,16 @@
 export default async function handler(req, res) {
   try {
-    const flightRes = await fetch("https://opensky-network.org/api/states/all");
-    const data = await flightRes.json();
+    const response = await fetch("https://opensky-network.org/api/states/all", {
+      headers: {
+        "User-Agent": "Mozilla/5.0"
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error("OpenSky API failed");
+    }
+
+    const data = await response.json();
 
     const flights = (data.states || []).map(f => ({
       icao: f[0],
@@ -32,6 +41,9 @@ export default async function handler(req, res) {
     });
 
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({
+      error: "Flight data fetch failed",
+      details: err.message
+    });
   }
 }
