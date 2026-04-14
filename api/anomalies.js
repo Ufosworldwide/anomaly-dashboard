@@ -1,3 +1,13 @@
+export default async function handler(req, res) {
+  try {
+    // TEMP DEBUG - remove after fix
+    const key = process.env.FIREBASE_PRIVATE_KEY;
+    console.log("KEY START:", key?.substring(0, 50));
+    console.log("KEY END:", key?.substring(key.length - 50));
+    console.log("KEY LENGTH:", key?.length);
+    console.log("CLIENT EMAIL:", process.env.FIREBASE_CLIENT_EMAIL);
+
+
 import { db } from "../firebase.js";
 
 // ─────────────────────────────────────────────
