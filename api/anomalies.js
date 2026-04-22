@@ -513,8 +513,180 @@ async function writePins(anomalies, caseId, date) {
 }
 
 // ─────────────────────────────────────────────
-// MAIN HANDLER
+// GOOGLE SHEETS LOGGER
 // ─────────────────────────────────────────────
+
+const SHEET_ID = "1Rt55Hs_sErBOm3kHRARc9Xap0N0WlmzeDuucDZ2lFmk";
+const SHEET_RANGE = "Sheet1!A:Z";
+
+const HEADERS = [
+  "Date",
+  "Overall Status",
+  "Total Anomalies",
+  "Feeds Active",
+  "GPDM Chain Flags",
+  // Kp
+  "Kp Peak",
+  "Kp Average",
+  "Kp Status",
+  "Kp Storm Readings",
+  // Solar Wind
+  "Solar Wind Speed km/s",
+  "Solar Wind Density p/cm³",
+  "Solar Wind Bz nT",
+  "Solar Wind Bt nT",
+  "Solar Wind Status",
+  // F10.7
+  "F10.7 Flux sfu",
+  "F10.7 Status",
+  // GOES X-Ray
+  "GOES Flare Class",
+  "GOES Peak Class 24h",
+  "GOES Status",
+  // Schumann
+  "Schumann Dst nT",
+  "Schumann Min Dst 12h",
+  "Schumann SR Disturbance",
+  "Schumann Status",
+  // Ionosphere
+  "Ionosphere Bz nT",
+  "Ionosphere TEC Disturbance",
+  "Ionosphere Status",
+  // Seismic
+  "Seismic Total Events",
+  "Seismic Above M3",
+  "Seismic Above M5",
+  "Seismic Above M6",
+  "Seismic Peak Magnitude",
+  "Seismic Average Magnitude",
+  "Seismic Status",
+  // Solar/DONKI
+  "Solar Total Flares",
+  "Solar M-Class",
+  "Solar X-Class",
+  "Solar CMEs",
+  "Solar Earth-Directed CMEs",
+  "Solar Status"
+];
+
+async function getGoogleAccessToken() {
+  // Use Firebase Admin SDK service account to get Google OAuth token for Sheets API
+  const { GoogleAuth } = await import("google-auth-library");
+  const auth = new GoogleAuth({
+    credentials: {
+      client_email: process.env.FIREBASE_CLIENT_EMAIL,
+      private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n")
+    },
+    scopes: ["https://www.googleapis.com/auth/spreadsheets"]
+  });
+  const client = await auth.getClient();
+  const token = await client.getAccessToken();
+  return token.token;
+}
+
+async function appendToSheet(dailyCase, feedStats) {
+  try {
+    const token = await getGoogleAccessToken();
+    const fs = feedStats;
+
+    // Check if header row exists — append if sheet is empty
+    const checkRes = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${SHEET_RANGE}`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    const checkData = await checkRes.json();
+    const existingRows = checkData.values || [];
+
+    const rowsToAppend = [];
+
+    // Add header row if sheet is empty
+    if (existingRows.length === 0) {
+      rowsToAppend.push(HEADERS);
+    }
+
+    // Build data row
+    const kp = fs.kp_geomagnetic || {};
+    const sw = fs.solar_wind || {};
+    const f107 = fs.f107_solar_flux || {};
+    const goes = fs.goes_xray || {};
+    const sch = fs.schumann_proxy || {};
+    const tec = fs.ionosphere_tec || {};
+    const seis = fs.usgs_seismic || {};
+    const solar = fs.donki_solar || {};
+
+    const dataRow = [
+      dailyCase.date,
+      dailyCase.summary?.overall_status || "—",
+      dailyCase.summary?.total_anomalies ?? 0,
+      dailyCase.summary?.feeds_active ?? 0,
+      (dailyCase.summary?.cross_channel_flags || []).join(" | ") || "—",
+      // Kp
+      kp.peak_kp ?? "—",
+      kp.average_kp ?? "—",
+      kp.status || "—",
+      kp.storm_level_readings ?? "—",
+      // Solar Wind
+      sw.speed_kms ?? "—",
+      sw.density_pcm3 ?? "—",
+      sw.bz_nT ?? "—",
+      sw.bt_nT ?? "—",
+      sw.status || "—",
+      // F10.7
+      f107.flux_sfu ?? "—",
+      f107.status || "—",
+      // GOES
+      goes.current_class || "—",
+      goes.peak_class_24h || "—",
+      goes.status || "—",
+      // Schumann
+      sch.dst_nT ?? "—",
+      sch.min_dst_12h ?? "—",
+      sch.sr_disturbance_likely ?? "—",
+      sch.status || "—",
+      // TEC
+      tec.bz_nT ?? "—",
+      tec.tec_disturbance ?? "—",
+      tec.status || "—",
+      // Seismic
+      seis.total_events ?? "—",
+      seis.above_m3 ?? "—",
+      seis.above_m5 ?? "—",
+      seis.above_m6 ?? "—",
+      seis.peak_magnitude ?? "—",
+      seis.average_magnitude ?? "—",
+      seis.status || "—",
+      // Solar/DONKI
+      solar.total_flares ?? "—",
+      solar.m_class_flares ?? "—",
+      solar.x_class_flares ?? "—",
+      solar.cmes_detected ?? "—",
+      solar.earth_directed_cmes ?? "—",
+      solar.status || "—"
+    ];
+
+    rowsToAppend.push(dataRow);
+
+    // Append to sheet
+    await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${SHEET_RANGE}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ values: rowsToAppend })
+      }
+    );
+
+    return true;
+  } catch (e) {
+    console.error("Sheets append failed:", e.message);
+    return false;
+  }
+}
+
+
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -601,6 +773,9 @@ export default async function handler(req, res) {
     const pinsWritten = await writePins(allAnomalies, caseRef.id, pullDate);
     await stateRef.set({ last_pull: new Date().toISOString() });
 
+    // Append to Google Sheets data log — non-blocking, failure doesn't break the cron
+    const sheetWritten = await appendToSheet(dailyCase, dailyCase.feed_stats);
+
     res.status(200).json({
       success: true,
       case_id: caseRef.id,
@@ -608,6 +783,7 @@ export default async function handler(req, res) {
       pull_window: dailyCase.pull_window,
       summary: dailyCase.summary,
       pins_written: pinsWritten,
+      sheet_logged: sheetWritten,
       feed_stats: dailyCase.feed_stats
     });
 
