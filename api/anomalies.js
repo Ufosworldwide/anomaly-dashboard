@@ -486,6 +486,107 @@ function analyzeCrossChannel(feeds) {
 }
 
 // ─────────────────────────────────────────────
+// NASA OMNI — MULTI-VARIABLE SOLAR WIND HISTORICAL
+// Variable 1 multi-condition assessment
+// Historical depth back to 1963
+// ─────────────────────────────────────────────
+
+async function fetchOMNI() {
+  try {
+    const now = new Date();
+    const yesterday = new Date(now - 86400000);
+    const startDate = yesterday.toISOString().slice(0,10).replace(/-/g,'');
+    const endDate = now.toISOString().slice(0,10).replace(/-/g,'');
+
+    const params = new URLSearchParams({
+      activity: 'retrieve',
+      res: 'hour',
+      spacecraft: 'omni2',
+      start_date: startDate,
+      end_date: endDate,
+      table: '1',
+      view: '0'
+    });
+    ['8','13','23','24','40','38','50'].forEach(v => params.append('vars', v));
+
+    const res = await fetch('https://omniweb.gsfc.nasa.gov/cgi/nx1.cgi', {
+      method: 'POST',
+      body: params
+    });
+
+    const text = await res.text();
+    const lines = text.split('\n').filter(l => /^\s*\d{4}\s+\d+/.test(l));
+    if (lines.length === 0) return null;
+
+    const readings = lines.map(line => {
+      const p = line.trim().split(/\s+/);
+      return {
+        bt: parseFloat(p[3]),
+        bz: parseFloat(p[4]),
+        speed: parseFloat(p[5]),
+        density: parseFloat(p[6]),
+        kp: parseFloat(p[7]) / 10,
+        f107: parseFloat(p[8]),
+        dst: parseFloat(p[9])
+      };
+    }).filter(r => r.speed < 9000 && r.bt < 9000 && r.bz < 9000 && r.density < 9000);
+
+    if (readings.length === 0) return null;
+
+    const avgSpeed = readings.reduce((a,b) => a + b.speed, 0) / readings.length;
+    const minBz = Math.min(...readings.map(r => r.bz));
+    const maxDensity = Math.max(...readings.map(r => r.density));
+    const dstValues = readings.map(r => r.dst).filter(d => d > -9000);
+    const minDst = dstValues.length > 0 ? Math.min(...dstValues) : null;
+    const latestF107 = readings.filter(r => r.f107 < 9000).pop()?.f107 || null;
+
+    const activeConditions = [
+      avgSpeed > 500 && 'elevated solar wind speed',
+      minBz < -10 && 'southward Bz geoeffective',
+      maxDensity > 15 && 'high proton density',
+      minDst !== null && minDst < -30 && 'Dst depression'
+    ].filter(Boolean);
+
+    const isV1Major = activeConditions.length >= 3;
+    const isV1Elevated = activeConditions.length >= 2;
+
+    const anomalies = isV1Major ? [{
+      source: 'omni_historical',
+      time: new Date().toISOString(),
+      value: avgSpeed.toFixed(0),
+      label: `OMNI multi-condition V1 alert — ${activeConditions.join(', ')}`,
+      severity: 'major',
+      lat: null,
+      lng: null,
+      anomaly_score: Math.min(10, activeConditions.length * 2.5)
+    }] : [];
+
+    return {
+      feed: 'omni_historical',
+      stats: {
+        avg_speed_kms: parseFloat(avgSpeed.toFixed(1)),
+        min_bz_nT: parseFloat(minBz.toFixed(2)),
+        max_density_pcm3: parseFloat(maxDensity.toFixed(2)),
+        min_dst_nT: minDst !== null ? parseFloat(minDst.toFixed(1)) : null,
+        f107_sfu: latestF107,
+        readings_parsed: readings.length,
+        active_v1_conditions: activeConditions,
+        status: isV1Major
+          ? `MULTI-CONDITION V1 ALERT: ${activeConditions.join(' + ')}`
+          : isV1Elevated
+          ? `V1 ELEVATED: ${activeConditions.join(' + ')}`
+          : 'NOMINAL',
+        gpdm_note: 'NASA OMNI2 hourly — multi-variable V1 assessment. Historical depth to 1963.'
+      },
+      anomalies
+    };
+  } catch(e) {
+    console.error('OMNI fetch failed:', e.message);
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────
 // MAP PIN WRITER
 // ─────────────────────────────────────────────
 
@@ -566,7 +667,15 @@ const HEADERS = [
   "Solar X-Class",
   "Solar CMEs",
   "Solar Earth-Directed CMEs",
-  "Solar Status"
+  "Solar Status",
+  // OMNI
+  "OMNI Avg Speed km/s",
+  "OMNI Min Bz nT",
+  "OMNI Max Density",
+  "OMNI Min Dst nT",
+  "OMNI F10.7 sfu",
+  "OMNI V1 Conditions",
+  "OMNI Status"
 ];
 
 async function getGoogleAccessToken() {
@@ -613,6 +722,7 @@ async function appendToSheet(dailyCase, feedStats) {
     const tec = fs.ionosphere_tec || {};
     const seis = fs.usgs_seismic || {};
     const solar = fs.donki_solar || {};
+    const omni = fs.omni_historical || {};
 
     const dataRow = [
       dailyCase.date,
@@ -661,7 +771,15 @@ async function appendToSheet(dailyCase, feedStats) {
       solar.x_class_flares ?? "—",
       solar.cmes_detected ?? "—",
       solar.earth_directed_cmes ?? "—",
-      solar.status || "—"
+      solar.status || "—",
+      // OMNI
+      omni.avg_speed_kms ?? "—",
+      omni.min_bz_nT ?? "—",
+      omni.max_density_pcm3 ?? "—",
+      omni.min_dst_nT ?? "—",
+      omni.f107_sfu ?? "—",
+      (omni.active_v1_conditions || []).join(', ') || "—",
+      omni.status || "—"
     ];
 
     rowsToAppend.push(dataRow);
@@ -703,7 +821,7 @@ export default async function handler(req, res) {
     const [
       kpData, seismicData, solarData,
       solarWindData, f107Data, goesData,
-      schumannData, ionosphereData
+      schumannData, ionosphereData, omniData
     ] = await Promise.allSettled([
       fetchKp(lastPull),
       fetchSeismic(lastPull),
@@ -712,7 +830,8 @@ export default async function handler(req, res) {
       fetchF107(),
       fetchGoesXray(),
       fetchSchumann(),
-      fetchIonosphere()
+      fetchIonosphere(),
+      fetchOMNI()
     ]);
 
     const feeds = [
@@ -723,7 +842,8 @@ export default async function handler(req, res) {
       f107Data.status === "fulfilled" ? f107Data.value : null,
       goesData.status === "fulfilled" ? goesData.value : null,
       schumannData.status === "fulfilled" ? schumannData.value : null,
-      ionosphereData.status === "fulfilled" ? ionosphereData.value : null
+      ionosphereData.status === "fulfilled" ? ionosphereData.value : null,
+      omniData.status === "fulfilled" ? omniData.value : null
     ];
 
     const allAnomalies = feeds
@@ -763,7 +883,8 @@ export default async function handler(req, res) {
         f107_solar_flux: f107Data.status === "fulfilled" && f107Data.value ? f107Data.value.stats : null,
         goes_xray: goesData.status === "fulfilled" && goesData.value ? goesData.value.stats : null,
         schumann_proxy: schumannData.status === "fulfilled" && schumannData.value ? schumannData.value.stats : null,
-        ionosphere_tec: ionosphereData.status === "fulfilled" && ionosphereData.value ? ionosphereData.value.stats : null
+        ionosphere_tec: ionosphereData.status === "fulfilled" && ionosphereData.value ? ionosphereData.value.stats : null,
+        omni_historical: omniData.status === "fulfilled" && omniData.value ? omniData.value.stats : null
       },
       anomalies: allAnomalies,
       created_at: new Date().toISOString()
