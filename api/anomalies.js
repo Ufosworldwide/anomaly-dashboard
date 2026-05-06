@@ -19,23 +19,50 @@ async function fetchKp(since) {
       kp: parseFloat(r[1])
     }));
 
-  if (readings.length === 0) return null;
+  // Return baseline stats even when quiet — don't drop the feed on calm days
+  if (readings.length === 0) {
+    return {
+      feed: "kp_geomagnetic",
+      stats: {
+        readings_captured: 0,
+        peak_kp: 0,
+        average_kp: 0,
+        storm_level_readings: 0,
+        status: "QUIET"
+      },
+      anomalies: []
+    };
+  }
 
   const values = readings.map(r => r.kp);
   const peak = Math.max(...values);
   const average = values.reduce((a, b) => a + b, 0) / values.length;
   const stormReadings = readings.filter(r => r.kp >= 5);
+  // Flag elevated Kp (>=4) as moderate anomaly even below storm threshold
+  const elevatedReadings = readings.filter(r => r.kp >= 4 && r.kp < 5);
 
-  const anomalies = stormReadings.map(r => ({
-    source: "kp_geomagnetic",
-    time: r.time,
-    value: r.kp,
-    label: `Geomagnetic storm — Kp ${r.kp}`,
-    severity: r.kp >= 7 ? "extreme" : r.kp >= 6 ? "severe" : "moderate",
-    lat: null,
-    lng: null,
-    anomaly_score: Math.min(10, (r.kp / 9) * 10)
-  }));
+  const anomalies = [
+    ...stormReadings.map(r => ({
+      source: "kp_geomagnetic",
+      time: r.time,
+      value: r.kp,
+      label: `Geomagnetic storm — Kp ${r.kp}`,
+      severity: r.kp >= 7 ? "extreme" : r.kp >= 6 ? "major" : "significant",
+      lat: null,
+      lng: null,
+      anomaly_score: Math.min(10, (r.kp / 9) * 10)
+    })),
+    ...elevatedReadings.map(r => ({
+      source: "kp_geomagnetic",
+      time: r.time,
+      value: r.kp,
+      label: `Geomagnetic activity elevated — Kp ${r.kp}`,
+      severity: "moderate",
+      lat: null,
+      lng: null,
+      anomaly_score: Math.min(10, (r.kp / 9) * 10)
+    }))
+  ];
 
   return {
     feed: "kp_geomagnetic",
@@ -60,7 +87,19 @@ async function fetchSeismic(since) {
   const raw = await res.json();
 
   const events = raw.features || [];
-  if (events.length === 0) return null;
+  if (events.length === 0) return {
+    feed: "usgs_seismic",
+    stats: {
+      total_events: 0,
+      above_m3: 0,
+      above_m5: 0,
+      above_m6: 0,
+      peak_magnitude: 0,
+      average_magnitude: 0,
+      status: "QUIET"
+    },
+    anomalies: []
+  };
 
   const magnitudes = events.map(e => e.properties.mag);
   const significant = events.filter(e => e.properties.mag >= 5.0);
@@ -544,374 +583,4 @@ async function fetchOMNI() {
       avgSpeed > 500 && 'elevated solar wind speed',
       minBz < -10 && 'southward Bz geoeffective',
       maxDensity > 15 && 'high proton density',
-      minDst !== null && minDst < -30 && 'Dst depression'
-    ].filter(Boolean);
-
-    const isV1Major = activeConditions.length >= 3;
-    const isV1Elevated = activeConditions.length >= 2;
-
-    const anomalies = isV1Major ? [{
-      source: 'omni_historical',
-      time: new Date().toISOString(),
-      value: avgSpeed.toFixed(0),
-      label: `OMNI multi-condition V1 alert — ${activeConditions.join(', ')}`,
-      severity: 'major',
-      lat: null,
-      lng: null,
-      anomaly_score: Math.min(10, activeConditions.length * 2.5)
-    }] : [];
-
-    return {
-      feed: 'omni_historical',
-      stats: {
-        avg_speed_kms: parseFloat(avgSpeed.toFixed(1)),
-        min_bz_nT: parseFloat(minBz.toFixed(2)),
-        max_density_pcm3: parseFloat(maxDensity.toFixed(2)),
-        min_dst_nT: minDst !== null ? parseFloat(minDst.toFixed(1)) : null,
-        f107_sfu: latestF107,
-        readings_parsed: readings.length,
-        active_v1_conditions: activeConditions,
-        status: isV1Major
-          ? `MULTI-CONDITION V1 ALERT: ${activeConditions.join(' + ')}`
-          : isV1Elevated
-          ? `V1 ELEVATED: ${activeConditions.join(' + ')}`
-          : 'NOMINAL',
-        gpdm_note: 'NASA OMNI2 hourly — multi-variable V1 assessment. Historical depth to 1963.'
-      },
-      anomalies
-    };
-  } catch(e) {
-    console.error('OMNI fetch failed:', e.message);
-    return null;
-  }
-}
-
-// ─────────────────────────────────────────────
-// MAP PIN WRITER
-// ─────────────────────────────────────────────
-
-async function writePins(anomalies, caseId, date) {
-  const geoAnomalies = anomalies.filter(a => a.lat !== null && a.lng !== null);
-  const batch = db.batch();
-
-  for (const a of geoAnomalies) {
-    const pinRef = db.collection("map_pins").doc();
-    batch.set(pinRef, {
-      case_id: caseId,
-      date,
-      source: a.source,
-      lat: a.lat,
-      lng: a.lng,
-      label: a.label,
-      severity: a.severity,
-      anomaly_score: a.anomaly_score,
-      created_at: new Date().toISOString()
-    });
-  }
-
-  if (geoAnomalies.length > 0) await batch.commit();
-  return geoAnomalies.length;
-}
-
-// ─────────────────────────────────────────────
-// GOOGLE SHEETS LOGGER
-// ─────────────────────────────────────────────
-
-const SHEET_ID = "1Rt55Hs_sErBOm3kHRARc9Xap0N0WlmzeDuucDZ2lFmk";
-const SHEET_RANGE = "Sheet1!A:Z";
-
-const HEADERS = [
-  "Date",
-  "Overall Status",
-  "Total Anomalies",
-  "Feeds Active",
-  "GPDM Chain Flags",
-  // Kp
-  "Kp Peak",
-  "Kp Average",
-  "Kp Status",
-  "Kp Storm Readings",
-  // Solar Wind
-  "Solar Wind Speed km/s",
-  "Solar Wind Density p/cm³",
-  "Solar Wind Bz nT",
-  "Solar Wind Bt nT",
-  "Solar Wind Status",
-  // F10.7
-  "F10.7 Flux sfu",
-  "F10.7 Status",
-  // GOES X-Ray
-  "GOES Flare Class",
-  "GOES Peak Class 24h",
-  "GOES Status",
-  // Schumann
-  "Schumann Dst nT",
-  "Schumann Min Dst 12h",
-  "Schumann SR Disturbance",
-  "Schumann Status",
-  // Ionosphere
-  "Ionosphere Bz nT",
-  "Ionosphere TEC Disturbance",
-  "Ionosphere Status",
-  // Seismic
-  "Seismic Total Events",
-  "Seismic Above M3",
-  "Seismic Above M5",
-  "Seismic Above M6",
-  "Seismic Peak Magnitude",
-  "Seismic Average Magnitude",
-  "Seismic Status",
-  // Solar/DONKI
-  "Solar Total Flares",
-  "Solar M-Class",
-  "Solar X-Class",
-  "Solar CMEs",
-  "Solar Earth-Directed CMEs",
-  "Solar Status",
-  // OMNI
-  "OMNI Avg Speed km/s",
-  "OMNI Min Bz nT",
-  "OMNI Max Density",
-  "OMNI Min Dst nT",
-  "OMNI F10.7 sfu",
-  "OMNI V1 Conditions",
-  "OMNI Status"
-];
-
-async function getGoogleAccessToken() {
-  // Use Firebase Admin SDK service account to get Google OAuth token for Sheets API
-  const { GoogleAuth } = await import("google-auth-library");
-  const auth = new GoogleAuth({
-    credentials: {
-      client_email: process.env.FIREBASE_CLIENT_EMAIL,
-      private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n")
-    },
-    scopes: ["https://www.googleapis.com/auth/spreadsheets"]
-  });
-  const client = await auth.getClient();
-  const token = await client.getAccessToken();
-  return token.token;
-}
-
-async function appendToSheet(dailyCase, feedStats) {
-  try {
-    const token = await getGoogleAccessToken();
-    const fs = feedStats;
-
-    // Check if header row exists — append if sheet is empty
-    const checkRes = await fetch(
-      `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${SHEET_RANGE}`,
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
-    const checkData = await checkRes.json();
-    const existingRows = checkData.values || [];
-
-    const rowsToAppend = [];
-
-    // Add header row if sheet is empty
-    if (existingRows.length === 0) {
-      rowsToAppend.push(HEADERS);
-    }
-
-    // Build data row
-    const kp = fs.kp_geomagnetic || {};
-    const sw = fs.solar_wind || {};
-    const f107 = fs.f107_solar_flux || {};
-    const goes = fs.goes_xray || {};
-    const sch = fs.schumann_proxy || {};
-    const tec = fs.ionosphere_tec || {};
-    const seis = fs.usgs_seismic || {};
-    const solar = fs.donki_solar || {};
-    const omni = fs.omni_historical || {};
-
-    const dataRow = [
-      dailyCase.date,
-      dailyCase.summary?.overall_status || "—",
-      dailyCase.summary?.total_anomalies ?? 0,
-      dailyCase.summary?.feeds_active ?? 0,
-      (dailyCase.summary?.cross_channel_flags || []).join(" | ") || "—",
-      // Kp
-      kp.peak_kp ?? "—",
-      kp.average_kp ?? "—",
-      kp.status || "—",
-      kp.storm_level_readings ?? "—",
-      // Solar Wind
-      sw.speed_kms ?? "—",
-      sw.density_pcm3 ?? "—",
-      sw.bz_nT ?? "—",
-      sw.bt_nT ?? "—",
-      sw.status || "—",
-      // F10.7
-      f107.flux_sfu ?? "—",
-      f107.status || "—",
-      // GOES
-      goes.current_class || "—",
-      goes.peak_class_24h || "—",
-      goes.status || "—",
-      // Schumann
-      sch.dst_nT ?? "—",
-      sch.min_dst_12h ?? "—",
-      sch.sr_disturbance_likely ?? "—",
-      sch.status || "—",
-      // TEC
-      tec.bz_nT ?? "—",
-      tec.tec_disturbance ?? "—",
-      tec.status || "—",
-      // Seismic
-      seis.total_events ?? "—",
-      seis.above_m3 ?? "—",
-      seis.above_m5 ?? "—",
-      seis.above_m6 ?? "—",
-      seis.peak_magnitude ?? "—",
-      seis.average_magnitude ?? "—",
-      seis.status || "—",
-      // Solar/DONKI
-      solar.total_flares ?? "—",
-      solar.m_class_flares ?? "—",
-      solar.x_class_flares ?? "—",
-      solar.cmes_detected ?? "—",
-      solar.earth_directed_cmes ?? "—",
-      solar.status || "—",
-      // OMNI
-      omni.avg_speed_kms ?? "—",
-      omni.min_bz_nT ?? "—",
-      omni.max_density_pcm3 ?? "—",
-      omni.min_dst_nT ?? "—",
-      omni.f107_sfu ?? "—",
-      (omni.active_v1_conditions || []).join(', ') || "—",
-      omni.status || "—"
-    ];
-
-    rowsToAppend.push(dataRow);
-
-    // Append to sheet
-    await fetch(
-      `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${SHEET_RANGE}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({ values: rowsToAppend })
-      }
-    );
-
-    return true;
-  } catch (e) {
-    console.error("Sheets append failed:", e.message);
-    return false;
-  }
-}
-
-
-
-export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  if (req.method === 'OPTIONS') { res.status(200).end(); return; }
-
-  try {
-    const stateRef = db.collection("system_state").doc("pull_tracker");
-    const stateDoc = await stateRef.get();
-    const lastPull = stateDoc.exists ? stateDoc.data().last_pull : null;
-    const pullDate = new Date().toISOString().split("T")[0];
-
-    // Fetch all eight feeds in parallel
-    const [
-      kpData, seismicData, solarData,
-      solarWindData, f107Data, goesData,
-      schumannData, ionosphereData, omniData
-    ] = await Promise.allSettled([
-      fetchKp(lastPull),
-      fetchSeismic(lastPull),
-      fetchSolar(lastPull),
-      fetchSolarWind(),
-      fetchF107(),
-      fetchGoesXray(),
-      fetchSchumann(),
-      fetchIonosphere(),
-      fetchOMNI()
-    ]);
-
-    const feeds = [
-      kpData.status === "fulfilled" ? kpData.value : null,
-      seismicData.status === "fulfilled" ? seismicData.value : null,
-      solarData.status === "fulfilled" ? solarData.value : null,
-      solarWindData.status === "fulfilled" ? solarWindData.value : null,
-      f107Data.status === "fulfilled" ? f107Data.value : null,
-      goesData.status === "fulfilled" ? goesData.value : null,
-      schumannData.status === "fulfilled" ? schumannData.value : null,
-      ionosphereData.status === "fulfilled" ? ionosphereData.value : null,
-      omniData.status === "fulfilled" ? omniData.value : null
-    ];
-
-    const allAnomalies = feeds
-      .filter(Boolean)
-      .flatMap(f => f.anomalies)
-      .sort((a, b) => new Date(a.time) - new Date(b.time));
-
-    const crossChannel = analyzeCrossChannel(feeds.filter(Boolean));
-
-    const dailyCase = {
-      case_type: "daily_anomaly_report",
-      date: pullDate,
-      pull_window: {
-        from: lastPull || new Date(Date.now() - 86400000).toISOString(),
-        to: new Date().toISOString()
-      },
-      summary: {
-        total_anomalies: allAnomalies.length,
-        feeds_active: feeds.filter(Boolean).length,
-        multi_channel_event: crossChannel.multi_channel,
-        cross_channel_flags: crossChannel.flags,
-        overall_status: crossChannel.flags.some(f => f.includes("PLANETARY CHAIN"))
-          ? "GPDM PLANETARY CHAIN ACTIVE"
-          : crossChannel.flags.some(f => f.includes("CME CHAIN"))
-          ? "GPDM CME CHAIN ACTIVE"
-          : crossChannel.multi_channel
-          ? "MULTI-CHANNEL ANOMALY"
-          : allAnomalies.length > 0
-          ? "ANOMALIES DETECTED"
-          : "BASELINE NORMAL"
-      },
-      feed_stats: {
-        kp_geomagnetic: kpData.status === "fulfilled" && kpData.value ? kpData.value.stats : null,
-        usgs_seismic: seismicData.status === "fulfilled" && seismicData.value ? seismicData.value.stats : null,
-        donki_solar: solarData.status === "fulfilled" && solarData.value ? solarData.value.stats : null,
-        solar_wind: solarWindData.status === "fulfilled" && solarWindData.value ? solarWindData.value.stats : null,
-        f107_solar_flux: f107Data.status === "fulfilled" && f107Data.value ? f107Data.value.stats : null,
-        goes_xray: goesData.status === "fulfilled" && goesData.value ? goesData.value.stats : null,
-        schumann_proxy: schumannData.status === "fulfilled" && schumannData.value ? schumannData.value.stats : null,
-        ionosphere_tec: ionosphereData.status === "fulfilled" && ionosphereData.value ? ionosphereData.value.stats : null,
-        omni_historical: omniData.status === "fulfilled" && omniData.value ? omniData.value.stats : null
-      },
-      anomalies: allAnomalies,
-      created_at: new Date().toISOString()
-    };
-
-    const caseRef = await db.collection("daily_reports").add(dailyCase);
-    const pinsWritten = await writePins(allAnomalies, caseRef.id, pullDate);
-    await stateRef.set({ last_pull: new Date().toISOString() });
-
-    // Append to Google Sheets data log — non-blocking, failure doesn't break the cron
-    const sheetWritten = await appendToSheet(dailyCase, dailyCase.feed_stats);
-
-    res.status(200).json({
-      success: true,
-      case_id: caseRef.id,
-      date: pullDate,
-      pull_window: dailyCase.pull_window,
-      summary: dailyCase.summary,
-      pins_written: pinsWritten,
-      sheet_logged: sheetWritten,
-      feed_stats: dailyCase.feed_stats
-    });
-
-  } catch (err) {
-    res.status(500).json({
-      error: "Daily pull failed",
-      details: err.message
-    });
-  }
-}
+      minDst !== null && minDst < -30 &&
