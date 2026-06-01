@@ -1,4 +1,18 @@
 {
+  "redirects": [
+    {
+      "source": "/(.*)",
+      "has": [{"type": "host", "value": "ufosworldwide.com"}],
+      "destination": "https://www.ufosworldwide.com/$1",
+      "permanent": true
+    },
+    {
+      "source": "/(.*)",
+      "has": [{"type": "host", "value": "www.ufosworldwide.com"}],
+      "destination": "https://www.ufosworldwide.com/$1",
+      "permanent": true
+    }
+  ],
   "rewrites": [
     { "source": "/api/(.*)", "destination": "/api/$1" }
   ],
